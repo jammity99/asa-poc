@@ -7,6 +7,10 @@ on:
   pull_request:                # auto-run on PRs targeting main
   workflow_dispatch:           # manual run button in Actions tab
 
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   asa-scan:
     runs-on: windows-latest
