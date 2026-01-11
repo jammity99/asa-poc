@@ -1,0 +1,95 @@
+
+name: ASA Security Scan
+
+on:
+  push:
+    branches: [ main ]        # auto-run on commits to main
+  pull_request:                # auto-run on PRs targeting main
+  workflow_dispatch:           # manual run button in Actions tab
+
+jobs:
+  asa-scan:
+    runs-on: windows-latest
+
+    steps:
+      # 1) Checkout your repository code
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) Setup .NET (required for ASA CLI global tool)
+      - name: Setup .NET (for ASA CLI)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # 3) Install Attack Surface Analyzer (ASA) CLI
+      - name: Install ASA CLI
+        shell: pwsh
+        run: dotnet tool install -g Microsoft.CST.AttackSurfaceAnalyzer.CLI
+
+      # 4) Baseline snapshot
+      #    Scope Files to the repo workspace; include system collectors
+      - name: Baseline collect
+        shell: pwsh
+        run: |
+          asa collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
+
+      # 5) Run your app script (creates a small file ASA will detect)
+      - name: Execute app script
+        shell: pwsh
+        run: |
+          python --version 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "[INFO] Python not preset; installing minimal Python via winget is not supported on hosted runners. Using preinstalled runner Python."
+          }
+          if (Test-Path "${{ github.workspace }}\app\asset.py") {
+            python "${{ github.workspace }}\app\asset.py"
+          } else {
+            Write-Host "[INFO] No app/asset.py found. Creating a demo file so ASA has a diff to report."
+            New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\artifacts\demo" | Out-error" }            New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\artifacts\demo" | Out-Null
+          if ($high) {
+            Write-Error "High severity ASA findings detected! Failing the workflow."
+            exit 1
+          } else {
+            Write-Host "[OK] No High severity ASA findings."
+          }
+
+      # 9) Upload SARIF to GitHub Security (Code Scanning alerts)
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: attack_surface_analyzer.sarif
+
+      # 10) Upload artifacts for later download (optional)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: asa-outputs
+          path: |
+            attack_surface_analyzer.sarif
+            artifacts/**
+            Set-Content -Path "${{ github.workspace }}\artifacts\demo\hello.txt" -Value "ASA should detect this file."
+          }
+
+      # 6) Product snapshot
+      - name: Product collect
+        shell: pwsh
+        run: |
+          asa collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
+
+      # 7) Compare snapshots & export SARIF
+      - name: Export SARIF
+        shell: pwsh
+        run: |
+          asa export-collect --outputsarif
+
+      # 8) Optional: Fail on High severity ASA findings (gate)
+      - name: Fail on High Severity (gate)
+        shell: pwsh
+        run: |
+          $sarifPath = "${{ github.workspace }}\attack_surface_analyzer.sarif"
+          if (-not (Test-Path $sarifPath)) {
+            Write-Error "SARIF file not found at $sarifPath. Ensure 'Export SARIF' step succeeded."
+            exit 1
+          }
+          $sarif = Get-Content $sarifPath -Raw | ConvertFrom-Json
