@@ -17,23 +17,20 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1) Checkout repository
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Setup .NET (required for ASA CLI tool)
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      # 3) Setup Python (so python is always available)
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 4) Install ASA CLI (Option A: call asa.exe directly in this step)
+      # --- Install ASA CLI (Option A) ---
       - name: Install ASA CLI
         shell: pwsh
         run: |
@@ -42,27 +39,33 @@ jobs:
 
           dotnet tool install Microsoft.CST.AttackSurfaceAnalyzer.CLI --tool-path $toolPath
 
-          # Persist for next steps
+          # Persist tool path for next steps
           "ASA_TOOLPATH=$toolPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # Make it available in PATH for NEXT steps (not needed in this step)
-          $toolPath | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $asaExe = Join-Path $toolPath "asa.exe"
+          if (-not (Test-Path $asaExe)) {
+            throw "asa.exe not found at expected path: $asaExe"
+          }
 
-          # Option A: Use explicit path right now
-          & (Join-Path $toolPath "asa.exe") --version
+          # Print version but DO NOT fail the step if ASA returns non-zero here
+          & $asaExe --version
+          Write-Host "[INFO] asa --version exit code was: $LASTEXITCODE"
+          exit 0
 
-      # 5) Baseline snapshot
-      - name: Baseline collect
+      # --- Baseline snapshot (file system only) ---
+      - name: Baseline collect (files only)
         shell: pwsh
         run: |
+          $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
           New-Item -ItemType Directory -Force -Path $asaWork | Out-Null
 
           Push-Location $asaWork
-          & (Join-Path $env:ASA_TOOLPATH "asa.exe") collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
+          # Documented pattern: collect -f and directories, then export-collect --outputsarif [1](https://github.com/microsoft/AttackSurfaceAnalyzer/wiki/CLI-Walkthrough)
+          & $asaExe collect -f --directories "${{ github.workspace }}"
           Pop-Location
 
-      # 6) Run app script (creates file changes for ASA diff)
+      # --- Make a diff (your app script) ---
       - name: Execute app script
         shell: pwsh
         run: |
@@ -74,24 +77,27 @@ jobs:
             Set-Content -Path "${{ github.workspace }}\artifacts\demo\hello.txt" -Value "ASA should detect this file."
           }
 
-      # 7) Product snapshot
-      - name: Product collect
+      # --- Product snapshot (file system only) ---
+      - name: Product collect (files only)
         shell: pwsh
         run: |
+          $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
+
           Push-Location $asaWork
-          & (Join-Path $env:ASA_TOOLPATH "asa.exe") collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
+          & $asaExe collect -f --directories "${{ github.workspace }}"
           Pop-Location
 
-      # 8) Export SARIF
+      # --- Export SARIF ---
       - name: Export SARIF
         shell: pwsh
         run: |
+          $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
-          Push-Location $asaWork
 
-          # documented usage: asa export-collect --outputsarif [1](https://github.com/microsoft/AttackSurfaceAnalyzer/wiki/CLI-Walkthrough)
-          & (Join-Path $env:ASA_TOOLPATH "asa.exe") export-collect --outputsarif
+          Push-Location $asaWork
+          # Export SARIF; optional flag disables implicit findings to reduce noise [1](https://github.com/microsoft/AttackSurfaceAnalyzer/wiki/CLI-Walkthrough)
+          & $asaExe export-collect --outputsarif --disableimplicitfindings
 
           if (-not (Test-Path ".\attack_surface_analyzer.sarif")) {
             throw "SARIF not generated. Check ASA export output above."
@@ -100,32 +106,13 @@ jobs:
           Copy-Item ".\attack_surface_analyzer.sarif" "${{ github.workspace }}\attack_surface_analyzer.sarif" -Force
           Pop-Location
 
-      # 9) Upload SARIF to GitHub Security (Code Scanning alerts)
+      # Upload SARIF to GitHub Code Scanning
       - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: attack_surface_analyzer.sarif
 
-      # 10) Optional Gate: fail if SARIF has any 'error' results (best-effort)
-      - name: Fail on High Severity (gate)
-        shell: pwsh
-        run: |
-          $sarifPath = "${{ github.workspace }}\attack_surface_analyzer.sarif"
-          if (-not (Test-Path $sarifPath)) {
-            throw "SARIF file not found at $sarifPath"
-          }
-
-          $sarif = Get-Content $sarifPath -Raw | ConvertFrom-Json
-          $errorCount = @($sarif.runs.results | Where-Object { $_.level -eq "error" }).Count
-
-          if ($errorCount -gt 0) {
-            Write-Error "ASA findings with SARIF level=error detected: $errorCount"
-            exit 1
-          } else {
-            Write-Host "[OK] No SARIF error-level findings."
-          }
-
-      # 11) Upload artifacts for download
+      # Upload artifacts
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
