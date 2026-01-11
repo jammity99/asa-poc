@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # --- Install ASA CLI (Option A) ---
+      # 1) Install ASA CLI (Option A: call asa.exe directly)
       - name: Install ASA CLI
         shell: pwsh
         run: |
@@ -39,21 +39,17 @@ jobs:
 
           dotnet tool install Microsoft.CST.AttackSurfaceAnalyzer.CLI --tool-path $toolPath
 
-          # Persist tool path for next steps
           "ASA_TOOLPATH=$toolPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           $asaExe = Join-Path $toolPath "asa.exe"
-          if (-not (Test-Path $asaExe)) {
-            throw "asa.exe not found at expected path: $asaExe"
-          }
+          if (-not (Test-Path $asaExe)) { throw "asa.exe not found: $asaExe" }
 
-          # Print version but DO NOT fail the step if ASA returns non-zero here
           & $asaExe --version
-          Write-Host "[INFO] asa --version exit code was: $LASTEXITCODE"
+          Write-Host "[INFO] asa --version exit code: $LASTEXITCODE"
           exit 0
 
-      # --- Baseline snapshot (file system only) ---
-      - name: Baseline collect (files only)
+      # 2) Baseline snapshot (files in repo + system collectors like ports/registry/services)
+      - name: Baseline collect (files + ports/registry/services)
         shell: pwsh
         run: |
           $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
@@ -61,11 +57,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $asaWork | Out-Null
 
           Push-Location $asaWork
-          # Documented pattern: collect -f and directories, then export-collect --outputsarif [1](https://github.com/microsoft/AttackSurfaceAnalyzer/wiki/CLI-Walkthrough)
-          & $asaExe collect -f --directories "${{ github.workspace }}"
+          # File scope limited to the repo; system collectors (ports/registry/services) are machine-level.
+          & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # --- Make a diff (your app script) ---
+      # 3) Create a diff (your app script)
       - name: Execute app script
         shell: pwsh
         run: |
@@ -77,42 +73,53 @@ jobs:
             Set-Content -Path "${{ github.workspace }}\artifacts\demo\hello.txt" -Value "ASA should detect this file."
           }
 
-      # --- Product snapshot (file system only) ---
-      - name: Product collect (files only)
+      # 4) Product snapshot
+      - name: Product collect (files + ports/registry/services)
         shell: pwsh
         run: |
           $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
 
           Push-Location $asaWork
-          & $asaExe collect -f --directories "${{ github.workspace }}"
+          & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # --- Export SARIF ---
-      - name: Export SARIF
+      # 5) Export SARIF (auto-detect produced SARIF file and copy to stable name)
+      - name: Export SARIF (normalize filename)
         shell: pwsh
         run: |
           $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
 
           Push-Location $asaWork
-          # Export SARIF; optional flag disables implicit findings to reduce noise [1](https://github.com/microsoft/AttackSurfaceAnalyzer/wiki/CLI-Walkthrough)
+
+          # Export SARIF using documented option. ASA compares the latest two runs if run IDs not provided. [1](https://www.microsoft.com/en-us/download/details.aspx?id=58105)
           & $asaExe export-collect --outputsarif --disableimplicitfindings
 
-          if (-not (Test-Path ".\attack_surface_analyzer.sarif")) {
-            throw "SARIF not generated. Check ASA export output above."
+          # ASA writes a timestamped file like *_summary.Sarif (as in your log)
+          $sarif = Get-ChildItem -File -Recurse |
+                   Where-Object { $_.Name -match '\.sarif$|\.Sarif$' } |
+                   Sort-Object LastWriteTime -Descending |
+                   Select-Object -First 1
+
+          if (-not $sarif) {
+            Write-Host "=== Directory listing (asa-work) ==="
+            Get-ChildItem -Recurse | Select-Object FullName
+            throw "No SARIF file found in asa-work after export-collect."
           }
 
-          Copy-Item ".\attack_surface_analyzer.sarif" "${{ github.workspace }}\attack_surface_analyzer.sarif" -Force
+          Write-Host "[OK] Found SARIF: $($sarif.FullName)"
+          Copy-Item $sarif.FullName "${{ github.workspace }}\attack_surface_analyzer.sarif" -Force
+
           Pop-Location
 
-      # Upload SARIF to GitHub Code Scanning
+      # 6) Upload SARIF to GitHub Security (Code Scanning alerts)
       - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: attack_surface_analyzer.sarif
 
-      # Upload artifacts
+      # 7) Upload artifacts for download
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
