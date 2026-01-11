@@ -17,43 +17,52 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1) Checkout
+      # 1) Checkout repository
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Setup .NET (for ASA global tool)
+      # 2) Setup .NET (required for ASA CLI tool)
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      # 3) Setup Python (so python is guaranteed)
+      # 3) Setup Python (so python is always available)
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 4) Install ASA CLI (use tool-path so we can reliably call `asa`)
+      # 4) Install ASA CLI (Option A: call asa.exe directly in this step)
       - name: Install ASA CLI
         shell: pwsh
         run: |
           $toolPath = Join-Path $env:RUNNER_TEMP "dotnet-tools"
           New-Item -ItemType Directory -Force -Path $toolPath | Out-Null
-          dotnet tool install Microsoft.CST.AttackSurfaceAnalyzer.CLI --tool-path $toolPath
-          $toolPath | Out-File -FilePath $env:GITHUB_PATH -Append
-          asa --version
 
-      # 5) Baseline snapshot (work from temp folder so ASA stores its state cleanly)
+          dotnet tool install Microsoft.CST.AttackSurfaceAnalyzer.CLI --tool-path $toolPath
+
+          # Persist for next steps
+          "ASA_TOOLPATH=$toolPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # Make it available in PATH for NEXT steps (not needed in this step)
+          $toolPath | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+          # Option A: Use explicit path right now
+          & (Join-Path $toolPath "asa.exe") --version
+
+      # 5) Baseline snapshot
       - name: Baseline collect
         shell: pwsh
         run: |
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
           New-Item -ItemType Directory -Force -Path $asaWork | Out-Null
+
           Push-Location $asaWork
-          asa collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
+          & (Join-Path $env:ASA_TOOLPATH "asa.exe") collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
           Pop-Location
 
-      # 6) Run your app script to create a diff
+      # 6) Run app script (creates file changes for ASA diff)
       - name: Execute app script
         shell: pwsh
         run: |
@@ -71,47 +80,52 @@ jobs:
         run: |
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
           Push-Location $asaWork
-          asa collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
+          & (Join-Path $env:ASA_TOOLPATH "asa.exe") collect -f -s -r -w -p --selected-directories "${{ github.workspace }}"
           Pop-Location
 
-      # 8) Export SARIF (from the same ASA working folder)
+      # 8) Export SARIF
       - name: Export SARIF
         shell: pwsh
         run: |
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
           Push-Location $asaWork
-          asa export-collect --outputsarif
+
+          # documented usage: asa export-collect --outputsarif [1](https://github.com/microsoft/AttackSurfaceAnalyzer/wiki/CLI-Walkthrough)
+          & (Join-Path $env:ASA_TOOLPATH "asa.exe") export-collect --outputsarif
+
           if (-not (Test-Path ".\attack_surface_analyzer.sarif")) {
             throw "SARIF not generated. Check ASA export output above."
           }
+
           Copy-Item ".\attack_surface_analyzer.sarif" "${{ github.workspace }}\attack_surface_analyzer.sarif" -Force
           Pop-Location
 
-      # 9) Upload SARIF to GitHub Security (Code Scanning)
+      # 9) Upload SARIF to GitHub Security (Code Scanning alerts)
       - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: attack_surface_analyzer.sarif
 
-      # 10) Optional Gate: Fail on High severity (best-effort)
+      # 10) Optional Gate: fail if SARIF has any 'error' results (best-effort)
       - name: Fail on High Severity (gate)
         shell: pwsh
         run: |
           $sarifPath = "${{ github.workspace }}\attack_surface_analyzer.sarif"
-          $sarif = Get-Content $sarifPath -Raw | ConvertFrom-Json
-
-          # Best-effort severity detection: ASA may encode severity differently per rule.
-          # We treat SARIF "error" level as high.
-          $highCount = @($sarif.runs.results | Where-Object { $_.level -eq "error" }).Count
-
-          if ($highCount -gt 0) {
-            Write-Error "High severity findings detected (error-level): $highCount"
-            exit 1
-          } else {
-            Write-Host "[OK] No error-level (high) findings."
+          if (-not (Test-Path $sarifPath)) {
+            throw "SARIF file not found at $sarifPath"
           }
 
-      # 11) Upload artifacts for later download
+          $sarif = Get-Content $sarifPath -Raw | ConvertFrom-Json
+          $errorCount = @($sarif.runs.results | Where-Object { $_.level -eq "error" }).Count
+
+          if ($errorCount -gt 0) {
+            Write-Error "ASA findings with SARIF level=error detected: $errorCount"
+            exit 1
+          } else {
+            Write-Host "[OK] No SARIF error-level findings."
+          }
+
+      # 11) Upload artifacts for download
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
