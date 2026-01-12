@@ -1,5 +1,5 @@
 
-name: ASA Security Scan
+name: ASA Security Scan test new
 
 on:
   push:
