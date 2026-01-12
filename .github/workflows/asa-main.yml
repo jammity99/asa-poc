@@ -170,73 +170,73 @@ jobs:
       # -------------------------------------------------------
       # ✅ GATE: Allowlist approved ports; fail on NEW ports
       # -------------------------------------------------------
-      - name: Gate - Fail on new listening ports not in allowlist
-        shell: pwsh
-        run: |
-          if (-not $env:BASELINE_PORTS_FILE -or -not (Test-Path $env:BASELINE_PORTS_FILE)) {
-            throw "Baseline ports file missing. BASELINE_PORTS_FILE=$env:BASELINE_PORTS_FILE"
-          }
+      
+- name: Gate - Fail on new listening ports not in allowlist
+  shell: pwsh
+  run: |
+    if (-not $env:BASELINE_PORTS_FILE -or -not (Test-Path $env:BASELINE_PORTS_FILE)) {
+      throw "Baseline ports file missing. BASELINE_PORTS_FILE=$env:BASELINE_PORTS_FILE"
+    }
 
-          # Parse allowlist
-          $allowRaw = $env:ASA_ALLOWED_PORTS
-          if ([string]::IsNullOrWhiteSpace($allowRaw)) {
-            throw "ASA_ALLOWED_PORTS is empty. Example: '80,443,8080'"
-          }
+    # Parse allowlist
+    $allowRaw = $env:ASA_ALLOWED_PORTS
+    if ([string]::IsNullOrWhiteSpace($allowRaw)) {
+      throw "ASA_ALLOWED_PORTS is empty. Example: '80,443,8080'"
+    }
 
-          $allowed = New-Object 'System.Collections.Generic.HashSet[int]'
-          $allowRaw.Split(",") | ForEach-Object {
-            $p = $_.Trim()
-            if ($p -match '^\d+$') { [void]$allowed.Add([int]$p) }
-          }
+    $allowed = New-Object 'System.Collections.Generic.HashSet[int]'
+    $allowRaw.Split(",") | ForEach-Object {
+      $p = $_.Trim()
+      if ($p -match '^\d+$') { [void]$allowed.Add([int]$p) }
+    }
 
-          Write-Host "[INFO] Allowed ports: $($allowed | Sort-Object | ForEach-Object { $_ } -join ',')"
+    # Load baseline ports
+    $baseline = New-Object 'System.Collections.Generic.HashSet[int]'
+    Get-Content $env:BASELINE_PORTS_FILE | ForEach-Object {
+      $line = $_.Trim()
+      if ($line -match '^\d+$') { [void]$baseline.Add([int]$line) }
+    }
 
-          # Load baseline ports
-          $baseline = New-Object 'System.Collections.Generic.HashSet[int]'
-          Get-Content $env:BASELINE_PORTS_FILE | ForEach-Object {
-            $line = $_.Trim()
-            if ($line -match '^\d+$') { [void]$baseline.Add([int]$line) }
-          }
+    # Capture current listening ports (filter loopback/wildcard to reduce noise)
+    $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
 
-          # Capture current listening ports (same noise-reduction filter)
-          $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
+    $currentPorts = Get-NetTCPConnection -State Listen |
+      Where-Object { $allowedAddrs -contains $_.LocalAddress } |
+      Select-Object -ExpandProperty LocalPort -Unique
 
-          $currentPorts = Get-NetTCPConnection -State Listen |
-            Where-Object { $allowedAddrs -contains $_.LocalAddress } |
-            Select-Object -ExpandProperty LocalPort -Unique
+    $current = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($p in $currentPorts) { [void]$current.Add([int]$p) }
 
-          $current = New-Object 'System.Collections.Generic.HashSet[int]'
-          foreach ($p in $currentPorts) { [void]$current.Add([int]$p) }
+    # Compute NEW ports (current - baseline)
+    $newPorts = @()
+    foreach ($p in $current) {
+      if (-not $baseline.Contains($p)) { $newPorts += $p }
+    }
+    $newPorts = $newPorts | Sort-Object -Unique
 
-          # Compute NEW ports (current - baseline)
-          $newPorts = @()
-          foreach ($p in $current) {
-            if (-not $baseline.Contains($p)) { $newPorts += $p }
-          }
-          $newPorts = $newPorts | Sort-Object -Unique
+    # Violations = newPorts not in allowlist
+    $violations = @()
+    foreach ($p in $newPorts) {
+      if (-not $allowed.Contains([int]$p)) { $violations += [int]$p }
+    }
+    $violations = $violations | Sort-Object -Unique
 
-          # Violations = newPorts not in allowlist
-          $violations = @()
-          foreach ($p in $newPorts) {
-            if (-not $allowed.Contains([int]$p)) { $violations += [int]$p }
-          }
-          $violations = $violations | Sort-Object -Unique
+    Write-Host "---- PORT GATE SUMMARY ----"
+    Write-Host ("Allowed ports : " + ([string]::Join(',', ($allowed  | Sort-Object))))
+    Write-Host ("Baseline ports: " + ([string]::Join(',', ($baseline | Sort-Object))))
+    Write-Host ("Current ports : " + ([string]::Join(',', ($current  | Sort-Object))))
+    Write-Host ("New ports     : " + ([string]::Join(',', ($newPorts | Sort-Object))))
+    Write-Host ("Violations    : " + ([string]::Join(',', ($violations | Sort-Object))))
+    Write-Host "---------------------------"
 
-          Write-Host "---- PORT GATE SUMMARY ----"
-          Write-Host "Baseline ports: $($baseline | Sort-Object | ForEach-Object { $_ } -join ',')"
-          Write-Host "Current ports : $($current  | Sort-Object | ForEach-Object { $_ } -join ',')"
-          Write-Host "New ports     : $($newPorts -join ',')"
-          Write-Host "Allowed ports : $($allowed | Sort-Object | ForEach-Object { $_ } -join ',')"
-          Write-Host "Violations    : $($violations -join ',')"
-          Write-Host "---------------------------"
+    if ($violations.Count -gt 0) {
+      Write-Error "Gate FAILED: New listening ports not in allowlist detected: $([string]::Join(',', $violations))"
+      exit 1
+    } else {
+      Write-Host "[OK] Gate PASSED: No new non-approved listening ports detected."
+      exit 0
+    }
 
-          if ($violations.Count -gt 0) {
-            Write-Error "Gate FAILED: New listening ports not in allowlist detected: $($violations -join ',')"
-            exit 1
-          } else {
-            Write-Host "[OK] Gate PASSED: No new non-approved listening ports detected."
-            exit 0
-          }
 
       # Upload SARIF even if gating fails (so findings are visible/auditable)
       - name: Upload SARIF to GitHub Security
