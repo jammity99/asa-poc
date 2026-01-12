@@ -1,5 +1,5 @@
 
-name: ASA Security Scan test new
+name: ASA Security Scan (Allowlist Port Gate)
 
 on:
   push:
@@ -16,6 +16,11 @@ jobs:
   asa-scan:
     runs-on: windows-latest
 
+    # ✅ Maintain approved ports here (comma-separated)
+    # For demo: keep 80,443 only so opening 9999 will FAIL the gate.
+    env:
+      ASA_ALLOWED_PORTS: "80,443"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,7 +35,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 1) Install ASA CLI (Option A: call asa.exe directly)
+      # -------------------------
+      # Install ASA CLI (Option A)
+      # -------------------------
       - name: Install ASA CLI
         shell: pwsh
         run: |
@@ -42,14 +49,44 @@ jobs:
           "ASA_TOOLPATH=$toolPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           $asaExe = Join-Path $toolPath "asa.exe"
-          if (-not (Test-Path $asaExe)) { throw "asa.exe not found: $asaExe" }
+          if (-not (Test-Path $asaExe)) { throw "asa.exe not found at $asaExe" }
 
           & $asaExe --version
           Write-Host "[INFO] asa --version exit code: $LASTEXITCODE"
           exit 0
 
-      # 2) Baseline snapshot (files in repo + system collectors like ports/registry/services)
-      - name: Baseline collect (files + ports/registry/services)
+      # -------------------------------------------------------
+      # Capture baseline listening ports (used for deterministic gate)
+      # -------------------------------------------------------
+      - name: Capture baseline listening ports (for gate)
+        shell: pwsh
+        run: |
+          $baselinePath = Join-Path $env:RUNNER_TEMP "baseline_ports.txt"
+
+          # Reduce noise: focus on loopback + wildcard bindings
+          $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
+
+          $ports = Get-NetTCPConnection -State Listen |
+            Where-Object { $allowedAddrs -contains $_.LocalAddress } |
+            Select-Object -ExpandProperty LocalPort -Unique |
+            Sort-Object
+
+          $ports | ForEach-Object { $_.ToString() } | Set-Content -Path $baselinePath -Encoding utf8
+
+          Write-Host "[INFO] Baseline listening ports saved to: $baselinePath"
+          Write-Host "[INFO] Baseline count: $($ports.Count)"
+          Write-Host ("[INFO] Baseline ports: " + ([string]::Join(',', $ports)))
+
+          "BASELINE_PORTS_FILE=$baselinePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # Copy into workspace so artifact upload is easy/reliable
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\artifacts\gate" | Out-Null
+          Copy-Item $baselinePath "${{ github.workspace }}\artifacts\gate\baseline_ports.txt" -Force
+
+      # ----------------------------
+      # Baseline ASA snapshot
+      # ----------------------------
+      - name: Baseline collect (files + registry + services + ports)
         shell: pwsh
         run: |
           $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
@@ -57,24 +94,45 @@ jobs:
           New-Item -ItemType Directory -Force -Path $asaWork | Out-Null
 
           Push-Location $asaWork
-          # File scope limited to the repo; system collectors (ports/registry/services) are machine-level.
           & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # 3) Create a diff (your app script)
-      - name: Execute app script
+      # ------------------------------------------------------
+      # Demo security change: open a NEW listening port (9999)
+      # ------------------------------------------------------
+      - name: Start demo listener on port 9999 (simulated risk)
+        shell: pwsh
+        run: |
+          $port = 9999
+          Write-Host "[INFO] Starting demo HTTP server on port $port AFTER baseline..."
+
+          $p = Start-Process -FilePath "python" -ArgumentList @("-m","http.server","9999","--bind","127.0.0.1") -PassThru -WindowStyle Hidden
+          "DEMO_PORT_PID=$($p.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Start-Sleep -Seconds 2
+
+          $ok = (Test-NetConnection -ComputerName "127.0.0.1" -Port $port).TcpTestSucceeded
+          if (-not $ok) {
+            Write-Error "Demo listener did not start correctly on port $port"
+            exit 1
+          }
+          Write-Host "[OK] Demo port $port is now listening (PID=$($p.Id))"
+
+      # Optional: file diff demo (kept)
+      - name: Execute app script (optional)
         shell: pwsh
         run: |
           if (Test-Path "${{ github.workspace }}\app\asset.py") {
             python "${{ github.workspace }}\app\asset.py"
           } else {
-            Write-Host "[INFO] app\asset.py not found. Creating demo diff file."
             New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\artifacts\demo" | Out-Null
             Set-Content -Path "${{ github.workspace }}\artifacts\demo\hello.txt" -Value "ASA should detect this file."
           }
 
-      # 4) Product snapshot
-      - name: Product collect (files + ports/registry/services)
+      # ----------------------------
+      # Product ASA snapshot
+      # ----------------------------
+      - name: Product collect (files + registry + services + ports)
         shell: pwsh
         run: |
           $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
@@ -84,7 +142,9 @@ jobs:
           & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # 5) Export SARIF (auto-detect produced SARIF file and copy to stable name)
+      # ----------------------------
+      # Export SARIF (normalize name)
+      # ----------------------------
       - name: Export SARIF (normalize filename)
         shell: pwsh
         run: |
@@ -92,38 +152,114 @@ jobs:
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
 
           Push-Location $asaWork
-
-          # Export SARIF using documented option. ASA compares the latest two runs if run IDs not provided. [1](https://www.microsoft.com/en-us/download/details.aspx?id=58105)
           & $asaExe export-collect --outputsarif --disableimplicitfindings
 
-          # ASA writes a timestamped file like *_summary.Sarif (as in your log)
           $sarif = Get-ChildItem -File -Recurse |
                    Where-Object { $_.Name -match '\.sarif$|\.Sarif$' } |
                    Sort-Object LastWriteTime -Descending |
                    Select-Object -First 1
 
           if (-not $sarif) {
-            Write-Host "=== Directory listing (asa-work) ==="
             Get-ChildItem -Recurse | Select-Object FullName
-            throw "No SARIF file found in asa-work after export-collect."
+            throw "No SARIF file found after export-collect."
           }
 
           Write-Host "[OK] Found SARIF: $($sarif.FullName)"
           Copy-Item $sarif.FullName "${{ github.workspace }}\attack_surface_analyzer.sarif" -Force
-
           Pop-Location
 
-      # 6) Upload SARIF to GitHub Security (Code Scanning alerts)
+      # -------------------------------------------------------
+      # ✅ GATE: Allowlist approved ports; FAIL on NEW ports
+      # -------------------------------------------------------
+      - name: Gate - Fail on new listening ports not in allowlist
+        shell: pwsh
+        run: |
+          if (-not $env:BASELINE_PORTS_FILE -or -not (Test-Path $env:BASELINE_PORTS_FILE)) {
+            throw "Baseline ports file missing. BASELINE_PORTS_FILE=$env:BASELINE_PORTS_FILE"
+          }
+
+          # ---- Parse allowlist ----
+          $allowRaw = $env:ASA_ALLOWED_PORTS
+          if ([string]::IsNullOrWhiteSpace($allowRaw)) {
+            throw "ASA_ALLOWED_PORTS is empty. Example: '80,443,8080'"
+          }
+
+          $allowed = New-Object 'System.Collections.Generic.HashSet[int]'
+          $allowRaw.Split(",") | ForEach-Object {
+            $p = $_.Trim()
+            if ($p -match '^\d+$') { [void]$allowed.Add([int]$p) }
+          }
+
+          # ---- Load baseline ports ----
+          $baseline = New-Object 'System.Collections.Generic.HashSet[int]'
+          Get-Content $env:BASELINE_PORTS_FILE | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -match '^\d+$') { [void]$baseline.Add([int]$line) }
+          }
+
+          # ---- Capture current listening ports (same filter as baseline) ----
+          $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
+
+          $currentPorts = Get-NetTCPConnection -State Listen |
+            Where-Object { $allowedAddrs -contains $_.LocalAddress } |
+            Select-Object -ExpandProperty LocalPort -Unique
+
+          $current = New-Object 'System.Collections.Generic.HashSet[int]'
+          foreach ($p in $currentPorts) { [void]$current.Add([int]$p) }
+
+          # ---- Compute NEW ports (current - baseline) ----
+          $newPorts = @()
+          foreach ($p in $current) {
+            if (-not $baseline.Contains($p)) { $newPorts += $p }
+          }
+          $newPorts = $newPorts | Sort-Object -Unique
+
+          # ---- Violations = NEW ports not in allowlist ----
+          $violations = @()
+          foreach ($p in $newPorts) {
+            if (-not $allowed.Contains([int]$p)) { $violations += [int]$p }
+          }
+          $violations = $violations | Sort-Object -Unique
+
+          Write-Host "---- PORT GATE SUMMARY ----"
+          Write-Host ("Allowed ports : " + ([string]::Join(',', ($allowed  | Sort-Object))))
+          Write-Host ("Baseline ports: " + ([string]::Join(',', ($baseline | Sort-Object))))
+          Write-Host ("Current ports : " + ([string]::Join(',', ($current  | Sort-Object))))
+          Write-Host ("New ports     : " + ([string]::Join(',', ($newPorts | Sort-Object))))
+          Write-Host ("Violations    : " + ([string]::Join(',', ($violations | Sort-Object))))
+          Write-Host "---------------------------"
+
+          if ($violations.Count -gt 0) {
+            Write-Error "Gate FAILED: New listening ports not in allowlist detected: $([string]::Join(',', $violations))"
+            exit 1
+          } else {
+            Write-Host "[OK] Gate PASSED: No new non-approved listening ports detected."
+            exit 0
+          }
+
+      # Upload SARIF even if gating fails
       - name: Upload SARIF to GitHub Security
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: attack_surface_analyzer.sarif
 
-      # 7) Upload artifacts for download
+      # Upload artifacts even if gating fails
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: asa-outputs
           path: |
             attack_surface_analyzer.sarif
             artifacts/**
+
+      # Cleanup: stop the demo listener
+      - name: Cleanup - stop demo listener
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:DEMO_PORT_PID) {
+            Write-Host "[INFO] Stopping demo listener PID=$env:DEMO_PORT_PID"
+            Stop-Process -Id $env:DEMO_PORT_PID -Force -ErrorAction SilentlyContinue
+          }
