@@ -17,7 +17,7 @@ jobs:
     runs-on: windows-latest
 
     # ✅ Maintain approved ports here (comma-separated)
-    # For the demo, DO NOT include 9999 so the gate will fail.
+    # For demo: keep 80,443 only so opening 9999 will FAIL the gate.
     env:
       ASA_ALLOWED_PORTS: "80,443"
 
@@ -63,7 +63,7 @@ jobs:
         run: |
           $baselinePath = Join-Path $env:RUNNER_TEMP "baseline_ports.txt"
 
-          # Filter to loopback + wildcard addresses to reduce noise
+          # Reduce noise: focus on loopback + wildcard bindings
           $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
 
           $ports = Get-NetTCPConnection -State Listen |
@@ -75,13 +75,16 @@ jobs:
 
           Write-Host "[INFO] Baseline listening ports saved to: $baselinePath"
           Write-Host "[INFO] Baseline count: $($ports.Count)"
-          Write-Host "[INFO] Baseline ports: $($ports -join ',')"
+          Write-Host ("[INFO] Baseline ports: " + ([string]::Join(',', $ports)))
 
           "BASELINE_PORTS_FILE=$baselinePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+          # Copy into workspace so artifact upload is easy/reliable
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\artifacts\gate" | Out-Null
+          Copy-Item $baselinePath "${{ github.workspace }}\artifacts\gate\baseline_ports.txt" -Force
+
       # ----------------------------
       # Baseline ASA snapshot
-      # Include ports (-p), registry (-r), services (-s), files (-f)
       # ----------------------------
       - name: Baseline collect (files + registry + services + ports)
         shell: pwsh
@@ -91,7 +94,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path $asaWork | Out-Null
 
           Push-Location $asaWork
-          # ASA is designed to collect/diff attack-surface components including network ports & registry/services. [2](https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-asr)
           & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
@@ -116,7 +118,7 @@ jobs:
           }
           Write-Host "[OK] Demo port $port is now listening (PID=$($p.Id))"
 
-      # Optional: your file-diff demo (kept as-is)
+      # Optional: file diff demo (kept)
       - name: Execute app script (optional)
         shell: pwsh
         run: |
@@ -142,7 +144,6 @@ jobs:
 
       # ----------------------------
       # Export SARIF (normalize name)
-      # ASA standard: export-collect --outputsarif (disableimplicitfindings optional). [1](https://nugetmusthaves.com/Package/Microsoft.CST.AttackSurfaceAnalyzer)
       # ----------------------------
       - name: Export SARIF (normalize filename)
         shell: pwsh
@@ -168,77 +169,75 @@ jobs:
           Pop-Location
 
       # -------------------------------------------------------
-      # ✅ GATE: Allowlist approved ports; fail on NEW ports
+      # ✅ GATE: Allowlist approved ports; FAIL on NEW ports
       # -------------------------------------------------------
-      
-- name: Gate - Fail on new listening ports not in allowlist
-  shell: pwsh
-  run: |
-    if (-not $env:BASELINE_PORTS_FILE -or -not (Test-Path $env:BASELINE_PORTS_FILE)) {
-      throw "Baseline ports file missing. BASELINE_PORTS_FILE=$env:BASELINE_PORTS_FILE"
-    }
+      - name: Gate - Fail on new listening ports not in allowlist
+        shell: pwsh
+        run: |
+          if (-not $env:BASELINE_PORTS_FILE -or -not (Test-Path $env:BASELINE_PORTS_FILE)) {
+            throw "Baseline ports file missing. BASELINE_PORTS_FILE=$env:BASELINE_PORTS_FILE"
+          }
 
-    # Parse allowlist
-    $allowRaw = $env:ASA_ALLOWED_PORTS
-    if ([string]::IsNullOrWhiteSpace($allowRaw)) {
-      throw "ASA_ALLOWED_PORTS is empty. Example: '80,443,8080'"
-    }
+          # ---- Parse allowlist ----
+          $allowRaw = $env:ASA_ALLOWED_PORTS
+          if ([string]::IsNullOrWhiteSpace($allowRaw)) {
+            throw "ASA_ALLOWED_PORTS is empty. Example: '80,443,8080'"
+          }
 
-    $allowed = New-Object 'System.Collections.Generic.HashSet[int]'
-    $allowRaw.Split(",") | ForEach-Object {
-      $p = $_.Trim()
-      if ($p -match '^\d+$') { [void]$allowed.Add([int]$p) }
-    }
+          $allowed = New-Object 'System.Collections.Generic.HashSet[int]'
+          $allowRaw.Split(",") | ForEach-Object {
+            $p = $_.Trim()
+            if ($p -match '^\d+$') { [void]$allowed.Add([int]$p) }
+          }
 
-    # Load baseline ports
-    $baseline = New-Object 'System.Collections.Generic.HashSet[int]'
-    Get-Content $env:BASELINE_PORTS_FILE | ForEach-Object {
-      $line = $_.Trim()
-      if ($line -match '^\d+$') { [void]$baseline.Add([int]$line) }
-    }
+          # ---- Load baseline ports ----
+          $baseline = New-Object 'System.Collections.Generic.HashSet[int]'
+          Get-Content $env:BASELINE_PORTS_FILE | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -match '^\d+$') { [void]$baseline.Add([int]$line) }
+          }
 
-    # Capture current listening ports (filter loopback/wildcard to reduce noise)
-    $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
+          # ---- Capture current listening ports (same filter as baseline) ----
+          $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
 
-    $currentPorts = Get-NetTCPConnection -State Listen |
-      Where-Object { $allowedAddrs -contains $_.LocalAddress } |
-      Select-Object -ExpandProperty LocalPort -Unique
+          $currentPorts = Get-NetTCPConnection -State Listen |
+            Where-Object { $allowedAddrs -contains $_.LocalAddress } |
+            Select-Object -ExpandProperty LocalPort -Unique
 
-    $current = New-Object 'System.Collections.Generic.HashSet[int]'
-    foreach ($p in $currentPorts) { [void]$current.Add([int]$p) }
+          $current = New-Object 'System.Collections.Generic.HashSet[int]'
+          foreach ($p in $currentPorts) { [void]$current.Add([int]$p) }
 
-    # Compute NEW ports (current - baseline)
-    $newPorts = @()
-    foreach ($p in $current) {
-      if (-not $baseline.Contains($p)) { $newPorts += $p }
-    }
-    $newPorts = $newPorts | Sort-Object -Unique
+          # ---- Compute NEW ports (current - baseline) ----
+          $newPorts = @()
+          foreach ($p in $current) {
+            if (-not $baseline.Contains($p)) { $newPorts += $p }
+          }
+          $newPorts = $newPorts | Sort-Object -Unique
 
-    # Violations = newPorts not in allowlist
-    $violations = @()
-    foreach ($p in $newPorts) {
-      if (-not $allowed.Contains([int]$p)) { $violations += [int]$p }
-    }
-    $violations = $violations | Sort-Object -Unique
+          # ---- Violations = NEW ports not in allowlist ----
+          $violations = @()
+          foreach ($p in $newPorts) {
+            if (-not $allowed.Contains([int]$p)) { $violations += [int]$p }
+          }
+          $violations = $violations | Sort-Object -Unique
 
-    Write-Host "---- PORT GATE SUMMARY ----"
-    Write-Host ("Allowed ports : " + ([string]::Join(',', ($allowed  | Sort-Object))))
-    Write-Host ("Baseline ports: " + ([string]::Join(',', ($baseline | Sort-Object))))
-    Write-Host ("Current ports : " + ([string]::Join(',', ($current  | Sort-Object))))
-    Write-Host ("New ports     : " + ([string]::Join(',', ($newPorts | Sort-Object))))
-    Write-Host ("Violations    : " + ([string]::Join(',', ($violations | Sort-Object))))
-    Write-Host "---------------------------"
+          Write-Host "---- PORT GATE SUMMARY ----"
+          Write-Host ("Allowed ports : " + ([string]::Join(',', ($allowed  | Sort-Object))))
+          Write-Host ("Baseline ports: " + ([string]::Join(',', ($baseline | Sort-Object))))
+          Write-Host ("Current ports : " + ([string]::Join(',', ($current  | Sort-Object))))
+          Write-Host ("New ports     : " + ([string]::Join(',', ($newPorts | Sort-Object))))
+          Write-Host ("Violations    : " + ([string]::Join(',', ($violations | Sort-Object))))
+          Write-Host "---------------------------"
 
-    if ($violations.Count -gt 0) {
-      Write-Error "Gate FAILED: New listening ports not in allowlist detected: $([string]::Join(',', $violations))"
-      exit 1
-    } else {
-      Write-Host "[OK] Gate PASSED: No new non-approved listening ports detected."
-      exit 0
-    }
+          if ($violations.Count -gt 0) {
+            Write-Error "Gate FAILED: New listening ports not in allowlist detected: $([string]::Join(',', $violations))"
+            exit 1
+          } else {
+            Write-Host "[OK] Gate PASSED: No new non-approved listening ports detected."
+            exit 0
+          }
 
-
-      # Upload SARIF even if gating fails (so findings are visible/auditable)
+      # Upload SARIF even if gating fails
       - name: Upload SARIF to GitHub Security
         if: always()
         uses: github/codeql-action/upload-sarif@v3
@@ -254,7 +253,6 @@ jobs:
           path: |
             attack_surface_analyzer.sarif
             artifacts/**
-            ${{ runner.temp }}\baseline_ports.txt
 
       # Cleanup: stop the demo listener
       - name: Cleanup - stop demo listener
