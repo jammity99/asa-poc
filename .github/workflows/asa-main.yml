@@ -1,12 +1,12 @@
 
-name: ASA Security Scan
+name: ASA Security Scan (Port Gating Demo)
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 1) Install ASA CLI (Option A: call asa.exe directly)
+      # Install ASA CLI (Option A)
       - name: Install ASA CLI
         shell: pwsh
         run: |
@@ -42,14 +42,13 @@ jobs:
           "ASA_TOOLPATH=$toolPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           $asaExe = Join-Path $toolPath "asa.exe"
-          if (-not (Test-Path $asaExe)) { throw "asa.exe not found: $asaExe" }
-
           & $asaExe --version
           Write-Host "[INFO] asa --version exit code: $LASTEXITCODE"
           exit 0
 
-      # 2) Baseline snapshot (files in repo + system collectors like ports/registry/services)
-      - name: Baseline collect (files + ports/registry/services)
+      # --- BASELINE COLLECT ---
+      # Include ports (-p). ASA supports reporting on network ports as part of attack surface changes. [1](https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-asr)
+      - name: Baseline collect (files + registry + services + ports)
         shell: pwsh
         run: |
           $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
@@ -57,24 +56,43 @@ jobs:
           New-Item -ItemType Directory -Force -Path $asaWork | Out-Null
 
           Push-Location $asaWork
-          # File scope limited to the repo; system collectors (ports/registry/services) are machine-level.
           & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # 3) Create a diff (your app script)
-      - name: Execute app script
+      # --- DEMO SECURITY CHANGE: OPEN A PORT AFTER BASELINE ---
+      - name: Start demo listener on port 9999 (simulated security change)
+        shell: pwsh
+        run: |
+          $port = 9999
+          Write-Host "[INFO] Starting demo HTTP server on port $port AFTER baseline..."
+          
+          # Start python HTTP server in background (persists across steps)
+          $p = Start-Process -FilePath "python" -ArgumentList @("-m","http.server","9999","--bind","127.0.0.1") -PassThru -WindowStyle Hidden
+          "DEMO_PORT_PID=$($p.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Start-Sleep -Seconds 2
+
+          # Verify port is listening
+          $ok = (Test-NetConnection -ComputerName "127.0.0.1" -Port $port).TcpTestSucceeded
+          if (-not $ok) {
+            Write-Error "Demo listener did not start correctly on port $port"
+            exit 1
+          }
+          Write-Host "[OK] Demo port $port is now listening (PID=$($p.Id))"
+
+      # (Optional) your app script to create file diff too
+      - name: Execute app script (optional)
         shell: pwsh
         run: |
           if (Test-Path "${{ github.workspace }}\app\asset.py") {
             python "${{ github.workspace }}\app\asset.py"
           } else {
-            Write-Host "[INFO] app\asset.py not found. Creating demo diff file."
             New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\artifacts\demo" | Out-Null
             Set-Content -Path "${{ github.workspace }}\artifacts\demo\hello.txt" -Value "ASA should detect this file."
           }
 
-      # 4) Product snapshot
-      - name: Product collect (files + ports/registry/services)
+      # --- PRODUCT COLLECT ---
+      - name: Product collect (files + registry + services + ports)
         shell: pwsh
         run: |
           $asaExe  = Join-Path $env:ASA_TOOLPATH "asa.exe"
@@ -84,7 +102,8 @@ jobs:
           & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # 5) Export SARIF (auto-detect produced SARIF file and copy to stable name)
+      # --- EXPORT SARIF ---
+      # ASA standard flow is export-collect --outputsarif; disable implicit findings optionally. [2](https://nugetmusthaves.com/Package/Microsoft.CST.AttackSurfaceAnalyzer)
       - name: Export SARIF (normalize filename)
         shell: pwsh
         run: |
@@ -92,38 +111,84 @@ jobs:
           $asaWork = Join-Path $env:RUNNER_TEMP "asa-work"
 
           Push-Location $asaWork
-
-          # Export SARIF using documented option. ASA compares the latest two runs if run IDs not provided. [1](https://www.microsoft.com/en-us/download/details.aspx?id=58105)
           & $asaExe export-collect --outputsarif --disableimplicitfindings
 
-          # ASA writes a timestamped file like *_summary.Sarif (as in your log)
+          # ASA outputs timestamped SARIF; pick the latest *.sarif/*.Sarif
           $sarif = Get-ChildItem -File -Recurse |
                    Where-Object { $_.Name -match '\.sarif$|\.Sarif$' } |
                    Sort-Object LastWriteTime -Descending |
                    Select-Object -First 1
 
           if (-not $sarif) {
-            Write-Host "=== Directory listing (asa-work) ==="
             Get-ChildItem -Recurse | Select-Object FullName
-            throw "No SARIF file found in asa-work after export-collect."
+            throw "No SARIF file found after export-collect."
           }
 
           Write-Host "[OK] Found SARIF: $($sarif.FullName)"
           Copy-Item $sarif.FullName "${{ github.workspace }}\attack_surface_analyzer.sarif" -Force
-
           Pop-Location
 
-      # 6) Upload SARIF to GitHub Security (Code Scanning alerts)
+      # --- GATE: FAIL IF THE NEW PORT APPEARS IN SARIF ---
+      - name: Gate - Fail if new listening port 9999 is detected
+        shell: pwsh
+        run: |
+          $sarifPath = "${{ github.workspace }}\attack_surface_analyzer.sarif"
+          if (-not (Test-Path $sarifPath)) { throw "SARIF missing: $sarifPath" }
+
+          $sarif = Get-Content $sarifPath -Raw | ConvertFrom-Json
+
+          # Collect all results across runs
+          $results = @()
+          foreach ($run in $sarif.runs) {
+            if ($run.results) { $results += $run.results }
+          }
+
+          # Look for port 9999 in message text or rule descriptions (robust for demo)
+          $hits = $results | Where-Object {
+            $msg = $_.message.text
+            ($msg -match '9999') -or ($msg -match 'port' -and $msg -match '9999')
+          }
+
+          $count = @($hits).Count
+          Write-Host "---- Port Gate Summary ----"
+          Write-Host "Forbidden port : 9999"
+          Write-Host "Matches found  : $count"
+          Write-Host "---------------------------"
+
+          if ($count -gt 0) {
+            Write-Host "[INFO] Sample matching message(s):"
+            $hits | Select-Object -First 3 | ForEach-Object { Write-Host (" - " + $_.message.text) }
+
+            Write-Error "Gate FAILED: New listening port 9999 detected by ASA."
+            exit 1
+          } else {
+            Write-Host "[OK] Gate PASSED: Port 9999 not detected in SARIF."
+            exit 0
+          }
+
+      # Upload SARIF to GitHub Security even if gating fails
       - name: Upload SARIF to GitHub Security
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: attack_surface_analyzer.sarif
 
-      # 7) Upload artifacts for download
+      # Upload artifacts even if gating fails
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: asa-outputs
           path: |
             attack_surface_analyzer.sarif
             artifacts/**
+
+      # Cleanup: stop the demo listener
+      - name: Cleanup - stop demo listener
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:DEMO_PORT_PID) {
+            Write-Host "[INFO] Stopping demo listener PID=$env:DEMO_PORT_PID"
+            Stop-Process -Id $env:DEMO_PORT_PID -Force -ErrorAction SilentlyContinue
+          }
