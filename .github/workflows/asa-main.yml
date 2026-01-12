@@ -1,12 +1,12 @@
 
-name: ASA Security Scan (Port Gating Demo)
+name: ASA Security Scan (Allowlist Port Gate)
 
 on:
-  workflow_dispatch:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +15,11 @@ permissions:
 jobs:
   asa-scan:
     runs-on: windows-latest
+
+    # ✅ Maintain approved ports here (comma-separated)
+    # For the demo, DO NOT include 9999 so the gate will fail.
+    env:
+      ASA_ALLOWED_PORTS: "80,443"
 
     steps:
       - name: Checkout
@@ -30,7 +35,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      # -------------------------
       # Install ASA CLI (Option A)
+      # -------------------------
       - name: Install ASA CLI
         shell: pwsh
         run: |
@@ -42,12 +49,40 @@ jobs:
           "ASA_TOOLPATH=$toolPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           $asaExe = Join-Path $toolPath "asa.exe"
+          if (-not (Test-Path $asaExe)) { throw "asa.exe not found at $asaExe" }
+
           & $asaExe --version
           Write-Host "[INFO] asa --version exit code: $LASTEXITCODE"
           exit 0
 
-      # --- BASELINE COLLECT ---
-      # Include ports (-p). ASA supports reporting on network ports as part of attack surface changes. [1](https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-asr)
+      # -------------------------------------------------------
+      # Capture baseline listening ports (used for deterministic gate)
+      # -------------------------------------------------------
+      - name: Capture baseline listening ports (for gate)
+        shell: pwsh
+        run: |
+          $baselinePath = Join-Path $env:RUNNER_TEMP "baseline_ports.txt"
+
+          # Filter to loopback + wildcard addresses to reduce noise
+          $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
+
+          $ports = Get-NetTCPConnection -State Listen |
+            Where-Object { $allowedAddrs -contains $_.LocalAddress } |
+            Select-Object -ExpandProperty LocalPort -Unique |
+            Sort-Object
+
+          $ports | ForEach-Object { $_.ToString() } | Set-Content -Path $baselinePath -Encoding utf8
+
+          Write-Host "[INFO] Baseline listening ports saved to: $baselinePath"
+          Write-Host "[INFO] Baseline count: $($ports.Count)"
+          Write-Host "[INFO] Baseline ports: $($ports -join ',')"
+
+          "BASELINE_PORTS_FILE=$baselinePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ----------------------------
+      # Baseline ASA snapshot
+      # Include ports (-p), registry (-r), services (-s), files (-f)
+      # ----------------------------
       - name: Baseline collect (files + registry + services + ports)
         shell: pwsh
         run: |
@@ -56,23 +91,24 @@ jobs:
           New-Item -ItemType Directory -Force -Path $asaWork | Out-Null
 
           Push-Location $asaWork
+          # ASA is designed to collect/diff attack-surface components including network ports & registry/services. [2](https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-asr)
           & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # --- DEMO SECURITY CHANGE: OPEN A PORT AFTER BASELINE ---
-      - name: Start demo listener on port 9999 (simulated security change)
+      # ------------------------------------------------------
+      # Demo security change: open a NEW listening port (9999)
+      # ------------------------------------------------------
+      - name: Start demo listener on port 9999 (simulated risk)
         shell: pwsh
         run: |
           $port = 9999
           Write-Host "[INFO] Starting demo HTTP server on port $port AFTER baseline..."
-          
-          # Start python HTTP server in background (persists across steps)
+
           $p = Start-Process -FilePath "python" -ArgumentList @("-m","http.server","9999","--bind","127.0.0.1") -PassThru -WindowStyle Hidden
           "DEMO_PORT_PID=$($p.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           Start-Sleep -Seconds 2
 
-          # Verify port is listening
           $ok = (Test-NetConnection -ComputerName "127.0.0.1" -Port $port).TcpTestSucceeded
           if (-not $ok) {
             Write-Error "Demo listener did not start correctly on port $port"
@@ -80,7 +116,7 @@ jobs:
           }
           Write-Host "[OK] Demo port $port is now listening (PID=$($p.Id))"
 
-      # (Optional) your app script to create file diff too
+      # Optional: your file-diff demo (kept as-is)
       - name: Execute app script (optional)
         shell: pwsh
         run: |
@@ -91,7 +127,9 @@ jobs:
             Set-Content -Path "${{ github.workspace }}\artifacts\demo\hello.txt" -Value "ASA should detect this file."
           }
 
-      # --- PRODUCT COLLECT ---
+      # ----------------------------
+      # Product ASA snapshot
+      # ----------------------------
       - name: Product collect (files + registry + services + ports)
         shell: pwsh
         run: |
@@ -102,8 +140,10 @@ jobs:
           & $asaExe collect -f -r -s -p --directories "${{ github.workspace }}"
           Pop-Location
 
-      # --- EXPORT SARIF ---
-      # ASA standard flow is export-collect --outputsarif; disable implicit findings optionally. [2](https://nugetmusthaves.com/Package/Microsoft.CST.AttackSurfaceAnalyzer)
+      # ----------------------------
+      # Export SARIF (normalize name)
+      # ASA standard: export-collect --outputsarif (disableimplicitfindings optional). [1](https://nugetmusthaves.com/Package/Microsoft.CST.AttackSurfaceAnalyzer)
+      # ----------------------------
       - name: Export SARIF (normalize filename)
         shell: pwsh
         run: |
@@ -113,7 +153,6 @@ jobs:
           Push-Location $asaWork
           & $asaExe export-collect --outputsarif --disableimplicitfindings
 
-          # ASA outputs timestamped SARIF; pick the latest *.sarif/*.Sarif
           $sarif = Get-ChildItem -File -Recurse |
                    Where-Object { $_.Name -match '\.sarif$|\.Sarif$' } |
                    Sort-Object LastWriteTime -Descending |
@@ -128,45 +167,78 @@ jobs:
           Copy-Item $sarif.FullName "${{ github.workspace }}\attack_surface_analyzer.sarif" -Force
           Pop-Location
 
-      # --- GATE: FAIL IF THE NEW PORT APPEARS IN SARIF ---
-      - name: Gate - Fail if new listening port 9999 is detected
+      # -------------------------------------------------------
+      # ✅ GATE: Allowlist approved ports; fail on NEW ports
+      # -------------------------------------------------------
+      - name: Gate - Fail on new listening ports not in allowlist
         shell: pwsh
         run: |
-          $sarifPath = "${{ github.workspace }}\attack_surface_analyzer.sarif"
-          if (-not (Test-Path $sarifPath)) { throw "SARIF missing: $sarifPath" }
-
-          $sarif = Get-Content $sarifPath -Raw | ConvertFrom-Json
-
-          # Collect all results across runs
-          $results = @()
-          foreach ($run in $sarif.runs) {
-            if ($run.results) { $results += $run.results }
+          if (-not $env:BASELINE_PORTS_FILE -or -not (Test-Path $env:BASELINE_PORTS_FILE)) {
+            throw "Baseline ports file missing. BASELINE_PORTS_FILE=$env:BASELINE_PORTS_FILE"
           }
 
-          # Look for port 9999 in message text or rule descriptions (robust for demo)
-          $hits = $results | Where-Object {
-            $msg = $_.message.text
-            ($msg -match '9999') -or ($msg -match 'port' -and $msg -match '9999')
+          # Parse allowlist
+          $allowRaw = $env:ASA_ALLOWED_PORTS
+          if ([string]::IsNullOrWhiteSpace($allowRaw)) {
+            throw "ASA_ALLOWED_PORTS is empty. Example: '80,443,8080'"
           }
 
-          $count = @($hits).Count
-          Write-Host "---- Port Gate Summary ----"
-          Write-Host "Forbidden port : 9999"
-          Write-Host "Matches found  : $count"
+          $allowed = New-Object 'System.Collections.Generic.HashSet[int]'
+          $allowRaw.Split(",") | ForEach-Object {
+            $p = $_.Trim()
+            if ($p -match '^\d+$') { [void]$allowed.Add([int]$p) }
+          }
+
+          Write-Host "[INFO] Allowed ports: $($allowed | Sort-Object | ForEach-Object { $_ } -join ',')"
+
+          # Load baseline ports
+          $baseline = New-Object 'System.Collections.Generic.HashSet[int]'
+          Get-Content $env:BASELINE_PORTS_FILE | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -match '^\d+$') { [void]$baseline.Add([int]$line) }
+          }
+
+          # Capture current listening ports (same noise-reduction filter)
+          $allowedAddrs = @("127.0.0.1","0.0.0.0","::","::1")
+
+          $currentPorts = Get-NetTCPConnection -State Listen |
+            Where-Object { $allowedAddrs -contains $_.LocalAddress } |
+            Select-Object -ExpandProperty LocalPort -Unique
+
+          $current = New-Object 'System.Collections.Generic.HashSet[int]'
+          foreach ($p in $currentPorts) { [void]$current.Add([int]$p) }
+
+          # Compute NEW ports (current - baseline)
+          $newPorts = @()
+          foreach ($p in $current) {
+            if (-not $baseline.Contains($p)) { $newPorts += $p }
+          }
+          $newPorts = $newPorts | Sort-Object -Unique
+
+          # Violations = newPorts not in allowlist
+          $violations = @()
+          foreach ($p in $newPorts) {
+            if (-not $allowed.Contains([int]$p)) { $violations += [int]$p }
+          }
+          $violations = $violations | Sort-Object -Unique
+
+          Write-Host "---- PORT GATE SUMMARY ----"
+          Write-Host "Baseline ports: $($baseline | Sort-Object | ForEach-Object { $_ } -join ',')"
+          Write-Host "Current ports : $($current  | Sort-Object | ForEach-Object { $_ } -join ',')"
+          Write-Host "New ports     : $($newPorts -join ',')"
+          Write-Host "Allowed ports : $($allowed | Sort-Object | ForEach-Object { $_ } -join ',')"
+          Write-Host "Violations    : $($violations -join ',')"
           Write-Host "---------------------------"
 
-          if ($count -gt 0) {
-            Write-Host "[INFO] Sample matching message(s):"
-            $hits | Select-Object -First 3 | ForEach-Object { Write-Host (" - " + $_.message.text) }
-
-            Write-Error "Gate FAILED: New listening port 9999 detected by ASA."
+          if ($violations.Count -gt 0) {
+            Write-Error "Gate FAILED: New listening ports not in allowlist detected: $($violations -join ',')"
             exit 1
           } else {
-            Write-Host "[OK] Gate PASSED: Port 9999 not detected in SARIF."
+            Write-Host "[OK] Gate PASSED: No new non-approved listening ports detected."
             exit 0
           }
 
-      # Upload SARIF to GitHub Security even if gating fails
+      # Upload SARIF even if gating fails (so findings are visible/auditable)
       - name: Upload SARIF to GitHub Security
         if: always()
         uses: github/codeql-action/upload-sarif@v3
@@ -182,6 +254,7 @@ jobs:
           path: |
             attack_surface_analyzer.sarif
             artifacts/**
+            ${{ runner.temp }}\baseline_ports.txt
 
       # Cleanup: stop the demo listener
       - name: Cleanup - stop demo listener
